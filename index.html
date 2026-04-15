@@ -11,6 +11,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 
+<!-- Librería SheetJS para leer/escribir archivos Excel -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
 <!-- ═══════════════════════════════════════════════════════════
      CSS — ESTILOS
      Sección 1: Variables y Reset
@@ -284,6 +287,54 @@ select.input {
 }
 .hidden { display: none !important; }
 
+/* Data management toolbar */
+.data-toolbar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  background: white;
+  border-bottom: 1px solid var(--borde);
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 700;
+  margin: -24px -24px 24px -24px;
+}
+.data-toolbar .toolbar-label {
+  font-size: 12px;
+  color: var(--cafe-suave);
+  font-weight: 500;
+  margin-right: 4px;
+}
+.btn-toolbar {
+  padding: 7px 14px;
+  border: 1.5px solid var(--borde);
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: var(--font-body);
+  background: white;
+  color: var(--cafe-medio);
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.btn-toolbar:hover { border-color: var(--verde); color: var(--verde-oscuro); background: var(--verde-estado-bg); }
+.btn-toolbar-primary { background: var(--verde-estado-bg); border-color: var(--verde); color: var(--verde-oscuro); }
+.toolbar-divider { width: 1px; height: 24px; background: var(--borde); margin: 0 4px; }
+.toolbar-status {
+  font-size: 11px;
+  color: var(--verde-estado);
+  background: var(--verde-estado-bg);
+  padding: 4px 10px;
+  border-radius: 12px;
+  animation: fadeIn 0.3s ease;
+}
+#file-input-hidden { display: none; }
+
 /* ────────────────────────────────────────────
    SECCIÓN 5: Dashboard
    ──────────────────────────────────────────── */
@@ -458,6 +509,8 @@ select.input {
     padding: 16px;
     padding-bottom: 80px;
   }
+  .data-toolbar { margin: -16px -16px 16px -16px; }
+  .toolbar-divider { display: none; }
   .page-header h1 { font-size: 22px; }
   .grid-cards { grid-template-columns: 1fr; }
   .grid-2col { grid-template-columns: 1fr; }
@@ -498,7 +551,25 @@ select.input {
 
   <!-- ── Main Content ── -->
   <main class="main-content" id="main-content">
-    <!-- Pages are rendered here by JS -->
+    <!-- Barra de datos: Sincronización con Google Sheets -->
+    <div class="data-toolbar">
+      <span class="toolbar-label">☁️ Google Sheets:</span>
+      <button class="btn-toolbar btn-toolbar-primary" onclick="syncFromSheets()">
+        🔄 Sincronizar
+      </button>
+      <div class="toolbar-divider"></div>
+      <button class="btn-toolbar" onclick="triggerImport()">
+        📥 Importar Excel
+      </button>
+      <button class="btn-toolbar" onclick="exportToExcel()">
+        📤 Exportar Excel
+      </button>
+      <span id="toolbar-status"></span>
+      <span id="connection-status"></span>
+    </div>
+    <input type="file" id="file-input-hidden" accept=".xlsx,.xls" onchange="handleFileImport(event)">
+    <!-- Contenedor de páginas (renderPage escribe aquí) -->
+    <div id="page-wrapper"></div>
   </main>
 </div>
 
@@ -586,18 +657,147 @@ function statusBadge(st) {
 }
 const CAT_COLORS = { Facial:"#7c9a92", Masaje:"#a67c6d", Corporal:"#8b7da8", Paquete:"#c4956a" };
 
-// Persistent storage
-async function loadData() {
-  try {
-    const r = await window.storage.get(STORAGE_KEY);
-    if (r && r.value) appData = JSON.parse(r.value);
-    else appData = JSON.parse(JSON.stringify(DEFAULT_DATA));
-  } catch {
-    appData = JSON.parse(JSON.stringify(DEFAULT_DATA));
+// ─────────────────────────────────────────────────
+// CONEXIÓN CON GOOGLE SHEETS (Apps Script API)
+// ─────────────────────────────────────────────────
+const API_URL = "https://script.google.com/macros/s/AKfycbzHbba9HR4JfC4Mxb5lrjH4g0fw8yq9YyhAUuU3ErMyjsDzPEDYwBhIgHt0Ql25wUZu9g/exec";
+
+let isOnline = true; // Indica si la conexión con Google Sheets está activa
+
+// Mostrar estado de conexión en la barra
+function showConnectionStatus(online) {
+  isOnline = online;
+  const el = $("#connection-status");
+  if (!el) return;
+  if (online) {
+    el.innerHTML = '<span class="toolbar-status" style="background:#e8f5e9;color:#2e7d32">🟢 Conectado</span>';
+  } else {
+    el.innerHTML = '<span class="toolbar-status" style="background:#fff3e0;color:#e65100">🟡 Modo local</span>';
   }
 }
+
+// ── LEER datos desde Google Sheets ──
+async function fetchSheet(sheetName) {
+  const res = await fetch(`${API_URL}?action=getAll&sheet=${sheetName}`);
+  if (!res.ok) throw new Error(`Error ${res.status}`);
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error || "Error desconocido");
+  return json.data;
+}
+
+// ── CARGAR todos los datos ──
+async function loadData() {
+  // Intentar cargar desde Google Sheets
+  try {
+    const [clients, services, appointments] = await Promise.all([
+      fetchSheet("Clientes"),
+      fetchSheet("Servicios"),
+      fetchSheet("Citas"),
+    ]);
+
+    appData = {
+      clients: clients.map(c => ({
+        id: String(c.id), name: c.nombre, phone: String(c.telefono),
+        email: c.email || "", registered: String(c.fechaRegistro),
+        type: c.tipoCliente || "Nuevo", lastVisit: String(c.ultimaVisita),
+        status: c.estado || "Activo", notes: c.observaciones || ""
+      })),
+      services: services.map(s => ({
+        id: String(s.id), name: s.nombre, category: s.categoria || "Facial",
+        price: Number(s.precio) || 0, duration: Number(s.duracion) || 0
+      })),
+      appointments: appointments.map(a => ({
+        id: String(a.id), date: String(a.fecha), clientId: String(a.clienteId),
+        serviceId: String(a.servicioId), value: Number(a.valor) || 0,
+        professional: a.profesional || "", status: a.estado || "Pendiente"
+      })),
+    };
+
+    // Guardar en localStorage como cache
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
+    showConnectionStatus(true);
+
+  } catch (err) {
+    console.warn("No se pudo conectar a Google Sheets, usando datos locales:", err);
+    // Fallback a localStorage
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) appData = JSON.parse(saved);
+      else appData = JSON.parse(JSON.stringify(DEFAULT_DATA));
+    } catch {
+      appData = JSON.parse(JSON.stringify(DEFAULT_DATA));
+    }
+    showConnectionStatus(false);
+  }
+}
+
+// ── GUARDAR un registro en Google Sheets ──
+async function apiSave(sheetName, registro) {
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" }, // Apps Script requiere text/plain para evitar preflight CORS
+      body: JSON.stringify({ action: "save", sheet: sheetName, data: registro }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    showConnectionStatus(true);
+    return true;
+  } catch (err) {
+    console.warn("Error guardando en Sheets:", err);
+    showConnectionStatus(false);
+    return false;
+  }
+}
+
+// ── GUARDAR toda una hoja completa ──
+async function apiSaveAll(sheetName, registros) {
+  try {
+    const res = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ action: "saveAll", sheet: sheetName, data: registros }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error);
+    showConnectionStatus(true);
+    return true;
+  } catch (err) {
+    console.warn("Error guardando hoja completa:", err);
+    showConnectionStatus(false);
+    return false;
+  }
+}
+
+// ── Convertir formato app → formato Google Sheets ──
+function clientToSheet(c) {
+  return { id:c.id, nombre:c.name, telefono:c.phone, email:c.email,
+    fechaRegistro:c.registered, tipoCliente:c.type, ultimaVisita:c.lastVisit,
+    estado:c.status, observaciones:c.notes };
+}
+function serviceToSheet(s) {
+  return { id:s.id, nombre:s.name, categoria:s.category, precio:s.price, duracion:s.duration };
+}
+function appointmentToSheet(a) {
+  return { id:a.id, fecha:a.date, clienteId:a.clientId, servicioId:a.serviceId,
+    valor:a.value, profesional:a.professional, estado:a.status };
+}
+
+// ── Cache local (siempre se guarda como respaldo) ──
 async function saveData() {
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(appData)); } catch {}
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(appData)); } catch {}
+}
+
+// ── Sincronizar manualmente desde Google Sheets ──
+async function syncFromSheets() {
+  showToolbarStatus("⏳ Sincronizando con Google Sheets...");
+  await loadData();
+  renderPage();
+  if (isOnline) {
+    showToolbarStatus("✅ Datos sincronizados desde Google Sheets");
+  } else {
+    showToolbarStatus("⚠️ No se pudo conectar. Mostrando datos locales.");
+  }
 }
 
 function $(sel) { return document.querySelector(sel); }
@@ -648,7 +848,7 @@ function navigate(view) {
 }
 
 function renderPage() {
-  const main = $("#main-content");
+  const wrapper = $("#page-wrapper");
   const item = NAV_ITEMS.find(n => n.key === currentView);
   const subtitles = {
     dashboard: "Resumen general del negocio",
@@ -664,7 +864,7 @@ function renderPage() {
   if (currentView === "appointments") actionBtn = `<button class="btn btn-primary" onclick="openModal('newAppointment')">+ Nueva Cita</button>`;
   if (currentView === "services") actionBtn = `<button class="btn btn-primary" onclick="openModal('newService')">+ Nuevo Servicio</button>`;
 
-  main.innerHTML = `
+  wrapper.innerHTML = `
     <div class="page-header">
       <div>
         <h1>${item.icon} ${item.label}</h1>
@@ -975,7 +1175,12 @@ function renderFollowUp() {
 
 function markFollowUp(id) {
   const c = appData.clients.find(c => c.id === id);
-  if (c) { c.status = "Seguimiento"; saveData(); renderFollowUp(); }
+  if (c) {
+    c.status = "Seguimiento";
+    apiSave("Clientes", clientToSheet(c)); // Actualizar en Sheets
+    saveData();
+    renderFollowUp();
+  }
 }
 
 /* ────────────────────────────────────────────
@@ -984,10 +1189,12 @@ function markFollowUp(id) {
 function renderGuide() {
   const el = $("#page-content");
   const sections = [
-    { title:"📝 Cómo Registrar un Cliente", steps:["Ve a 'Clientes' desde el menú.","Presiona '+ Nuevo Cliente'.","Llena nombre, teléfono (obligatorio), email, tipo y estado.","Agrega observaciones (alergias, preferencias).","Presiona 'Registrar Cliente'. ¡Listo!"] },
-    { title:"📅 Cómo Registrar una Cita", steps:["Ve a 'Citas' y presiona '+ Nueva Cita'.","Selecciona fecha, cliente y servicio.","El valor se calcula automáticamente.","Indica la profesional que atenderá.","Guarda. La última visita se actualiza sola."] },
+    { title:"☁️ Conexión con Google Sheets", steps:["Esta app se conecta automáticamente a Google Sheets al abrir.","El indicador '🟢 Conectado' en la barra superior confirma la conexión.","Si dice '🟡 Modo local', los datos se guardan solo en este dispositivo.","Usa el botón '🔄 Sincronizar' para actualizar los datos desde Google Sheets.","Todo lo que registres aquí se guarda en Google Sheets en tiempo real."] },
+    { title:"📝 Cómo Registrar un Cliente", steps:["Ve a 'Clientes' desde el menú.","Presiona '+ Nuevo Cliente'.","Llena nombre, teléfono (obligatorio), email, tipo y estado.","Agrega observaciones (alergias, preferencias).","Presiona 'Registrar Cliente'. Se guarda aquí y en Google Sheets."] },
+    { title:"📅 Cómo Registrar una Cita", steps:["Ve a 'Citas' y presiona '+ Nueva Cita'.","Selecciona fecha, cliente y servicio.","El valor se calcula automáticamente.","Indica la profesional que atenderá.","Guarda. La última visita del cliente se actualiza sola."] },
     { title:"🔔 Cómo Revisar Seguimiento", steps:["Ve a 'Seguimiento' al inicio de cada semana.","Revisa alertas: VIP primero, luego inactivos.","Contacta cada cliente por teléfono o WhatsApp.","Usa 'Marcar seguimiento' para actualizar estado.","Revisa el Dashboard para métricas generales."] },
     { title:"📊 Revisión Semanal Recomendada", steps:["LUNES: Dashboard — métricas e ingresos.","LUNES: Seguimiento — contactar prioritarios.","MIÉRCOLES: Revisar citas pendientes de la semana.","VIERNES: Actualizar estados de citas.","MENSUAL: Distribución de clientes y servicios top."] },
+    { title:"📥 Importar / Exportar Excel", steps:["'Importar Excel' sube datos desde un archivo .xlsx a la app y a Google Sheets.","'Exportar Excel' descarga todos los datos actuales como archivo .xlsx de respaldo.","El Excel exportado es compatible con el formato de importación.","Usa exportar como respaldo periódico (recomendado: semanal).","También puedes editar datos directamente en Google Sheets y luego Sincronizar."] },
     { title:"💡 Tips para Maximizar Resultados", steps:["Registra CADA cliente desde su primera visita.","Siempre agrega observaciones — personalización = recompra.","Los VIP deben visitarte al menos cada 3 semanas.","Si no vuelve en 30 días, activa promo de reactivación.","Usa los datos del Dashboard para tus campañas."] },
   ];
 
@@ -995,7 +1202,7 @@ function renderGuide() {
     <div class="guide-section" style="display:grid;gap:16px">
       <div class="banner-green">
         <h2 style="font-family:var(--font-display);font-size:22px;margin-bottom:6px">🌿 Guía de Uso — Aura Spa CRM</h2>
-        <p style="font-size:13px;opacity:0.9;line-height:1.5">Gestiona clientes, servicios, citas y seguimiento desde cualquier dispositivo. Los datos se guardan automáticamente.</p>
+        <p style="font-size:13px;opacity:0.9;line-height:1.5">Gestiona clientes, servicios, citas y seguimiento desde cualquier dispositivo. Los datos se sincronizan con Google Sheets en tiempo real.</p>
       </div>
       ${sections.map(s => `
         <div class="card">
@@ -1148,7 +1355,7 @@ function updateServiceInfo() {
   }
 }
 
-function saveClient(editId) {
+async function saveClient(editId) {
   const name = $("#f-name").value.trim();
   const phone = $("#f-phone").value.trim();
   if (!name || !phone) return alert("Nombre y teléfono son obligatorios.");
@@ -1162,56 +1369,252 @@ function saveClient(editId) {
   if (editId) {
     const c = getClient(editId);
     Object.assign(c, data);
+    apiSave("Clientes", clientToSheet(c)); // Guardar en Sheets (async)
   } else {
     const newId = "C" + String(appData.clients.length + 1).padStart(3, "0");
-    appData.clients.push({ id:newId, registered:TODAY, lastVisit:TODAY, ...data });
+    const newClient = { id:newId, registered:TODAY, lastVisit:TODAY, ...data };
+    appData.clients.push(newClient);
+    apiSave("Clientes", clientToSheet(newClient)); // Guardar en Sheets (async)
   }
   saveData();
   closeModal();
   renderPage();
 }
 
-function saveAppointment() {
+async function saveAppointment() {
   const date = $("#f-date").value;
   const clientId = $("#f-client").value;
   const serviceId = $("#f-service").value;
   if (!date || !clientId || !serviceId) return alert("Completa todos los campos obligatorios.");
   const svc = getService(serviceId);
   const newId = "A" + String(appData.appointments.length + 1).padStart(3, "0");
-  appData.appointments.push({
+  const newAppt = {
     id:newId, date, clientId, serviceId,
     value: svc?.price || 0,
     professional: $("#f-prof").value.trim(),
     status: $("#f-appt-status").value,
-  });
-  // Update last visit
+  };
+  appData.appointments.push(newAppt);
+  apiSave("Citas", appointmentToSheet(newAppt)); // Guardar en Sheets
+
+  // Actualizar última visita del cliente
   const client = getClient(clientId);
-  if (client && date >= client.lastVisit) client.lastVisit = date;
+  if (client && date >= client.lastVisit) {
+    client.lastVisit = date;
+    apiSave("Clientes", clientToSheet(client)); // Actualizar en Sheets
+  }
   saveData();
   closeModal();
   renderPage();
 }
 
-function saveService() {
+async function saveService() {
   const name = $("#f-svc-name").value.trim();
   const price = Number($("#f-svc-price").value);
   if (!name || !price) return alert("Nombre y precio son obligatorios.");
   const newId = "S" + String(appData.services.length + 1).padStart(3, "0");
-  appData.services.push({
+  const newSvc = {
     id:newId, name,
     category: $("#f-svc-cat").value,
     price,
     duration: Number($("#f-svc-dur").value) || 0,
-  });
+  };
+  appData.services.push(newSvc);
+  apiSave("Servicios", serviceToSheet(newSvc)); // Guardar en Sheets
   saveData();
   closeModal();
   renderPage();
 }
 
 /* ────────────────────────────────────────────
+   SECCIÓN J-2: Importar / Exportar Excel
+   ──────────────────────────────────────────── */
+
+function showToolbarStatus(msg) {
+  const el = $("#toolbar-status");
+  el.innerHTML = `<span class="toolbar-status">${msg}</span>`;
+  setTimeout(() => { el.innerHTML = ""; }, 4000);
+}
+
+// ── IMPORTAR EXCEL ──
+function triggerImport() {
+  $("#file-input-hidden").click();
+}
+
+function handleFileImport(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  showToolbarStatus("⏳ Leyendo archivo...");
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const workbook = XLSX.read(data, { type: "array" });
+
+      const sheetNames = workbook.SheetNames.map(s => s.toLowerCase().trim());
+      let imported = { clients: [], services: [], appointments: [] };
+
+      // ── Buscar hoja de CLIENTES ──
+      const clientSheet = workbook.SheetNames.find(s => s.toLowerCase().includes("cliente"));
+      if (clientSheet) {
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[clientSheet], { defval: "" });
+        imported.clients = rows.map((r, i) => ({
+          id: r["ID Cliente"] || r["ID"] || r["id"] || `C${String(i+1).padStart(3,"0")}`,
+          name: r["Nombre Completo"] || r["Nombre"] || r["nombre"] || "",
+          phone: String(r["Teléfono"] || r["Telefono"] || r["Tel"] || r["telefono"] || ""),
+          email: r["Email"] || r["Correo"] || r["email"] || "",
+          registered: String(r["Fecha Registro"] || r["Fecha de registro"] || r["Registro"] || TODAY),
+          type: r["Tipo Cliente"] || r["Tipo de cliente"] || r["Tipo"] || "Nuevo",
+          lastVisit: String(r["Última Visita"] || r["Ultima Visita"] || r["Última visita"] || TODAY),
+          status: r["Estado"] || "Activo",
+          notes: r["Observaciones"] || r["Notas"] || r["observaciones"] || "",
+        })).filter(c => c.name);
+      }
+
+      // ── Buscar hoja de SERVICIOS ──
+      const serviceSheet = workbook.SheetNames.find(s => s.toLowerCase().includes("servicio"));
+      if (serviceSheet) {
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[serviceSheet], { defval: "" });
+        imported.services = rows.map((r, i) => ({
+          id: r["ID Servicio"] || r["ID"] || `S${String(i+1).padStart(3,"0")}`,
+          name: r["Nombre del Servicio"] || r["Nombre"] || r["Servicio"] || "",
+          category: r["Categoría"] || r["Categoria"] || "Facial",
+          price: Number(r["Precio (COP)"] || r["Precio"] || r["precio"] || 0),
+          duration: Number(r["Duración (min)"] || r["Duración"] || r["Duracion"] || 0),
+        })).filter(s => s.name);
+      }
+
+      // ── Buscar hoja de CITAS ──
+      const apptSheet = workbook.SheetNames.find(s =>
+        s.toLowerCase().includes("cita") || s.toLowerCase().includes("registro")
+      );
+      if (apptSheet) {
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[apptSheet], { defval: "" });
+        imported.appointments = rows.map((r, i) => ({
+          id: r["ID Cita"] || r["ID"] || `A${String(i+1).padStart(3,"0")}`,
+          date: String(r["Fecha"] || r["fecha"] || TODAY),
+          clientId: r["ID Cliente"] || "",
+          serviceId: r["ID Servicio"] || "",
+          value: Number(r["Valor (COP)"] || r["Valor"] || r["valor"] || 0),
+          professional: r["Profesional"] || r["profesional"] || "",
+          status: r["Estado"] || "Pendiente",
+        })).filter(a => a.date);
+      }
+
+      // Validar que se importó algo
+      const totalImported = imported.clients.length + imported.services.length + imported.appointments.length;
+      if (totalImported === 0) {
+        alert("⚠️ No se encontraron datos reconocibles en el archivo.\n\nAsegúrate de que el Excel tenga hojas llamadas 'Clientes', 'Servicios' o 'Registro de Citas' con las columnas correctas.\n\nUsa el botón 'Exportar Excel' para ver el formato esperado.");
+        return;
+      }
+
+      // Confirmar importación
+      const msg = `Se encontraron:\n• ${imported.clients.length} clientes\n• ${imported.services.length} servicios\n• ${imported.appointments.length} citas\n\n¿Deseas reemplazar los datos actuales con estos?`;
+      if (!confirm(msg)) return;
+
+      // Aplicar datos localmente
+      if (imported.clients.length > 0) appData.clients = imported.clients;
+      if (imported.services.length > 0) appData.services = imported.services;
+      if (imported.appointments.length > 0) appData.appointments = imported.appointments;
+
+      saveData();
+      renderPage();
+      showToolbarStatus(`⏳ Importado localmente. Subiendo a Google Sheets...`);
+
+      // Subir a Google Sheets en paralelo
+      const uploads = [];
+      if (imported.clients.length > 0)
+        uploads.push(apiSaveAll("Clientes", appData.clients.map(clientToSheet)));
+      if (imported.services.length > 0)
+        uploads.push(apiSaveAll("Servicios", appData.services.map(serviceToSheet)));
+      if (imported.appointments.length > 0)
+        uploads.push(apiSaveAll("Citas", appData.appointments.map(appointmentToSheet)));
+
+      Promise.all(uploads).then(results => {
+        if (results.every(r => r)) {
+          showToolbarStatus(`✅ Importado y sincronizado: ${imported.clients.length} clientes, ${imported.services.length} servicios, ${imported.appointments.length} citas`);
+        } else {
+          showToolbarStatus(`⚠️ Importado localmente. Algunos datos no se subieron a Sheets.`);
+        }
+      });
+
+    } catch (err) {
+      console.error("Error al importar:", err);
+      alert("❌ Error al leer el archivo Excel.\n\nVerifica que sea un archivo .xlsx válido.");
+    }
+  };
+  reader.readAsArrayBuffer(file);
+  // Reset para permitir reimportar el mismo archivo
+  event.target.value = "";
+}
+
+// ── EXPORTAR A EXCEL ──
+function exportToExcel() {
+  try {
+    const wb = XLSX.utils.book_new();
+
+    // Hoja: Clientes
+    const clientHeaders = ["ID Cliente", "Nombre Completo", "Teléfono", "Email", "Fecha Registro", "Tipo Cliente", "Última Visita", "Estado", "Observaciones"];
+    const clientRows = appData.clients.map(c => [c.id, c.name, c.phone, c.email, c.registered, c.type, c.lastVisit, c.status, c.notes]);
+    const wsClients = XLSX.utils.aoa_to_sheet([clientHeaders, ...clientRows]);
+    wsClients["!cols"] = [{ wch:12 },{ wch:28 },{ wch:14 },{ wch:24 },{ wch:14 },{ wch:14 },{ wch:14 },{ wch:12 },{ wch:34 }];
+    XLSX.utils.book_append_sheet(wb, wsClients, "Clientes");
+
+    // Hoja: Servicios
+    const svcHeaders = ["ID Servicio", "Nombre del Servicio", "Categoría", "Precio (COP)", "Duración (min)"];
+    const svcRows = appData.services.map(s => [s.id, s.name, s.category, s.price, s.duration]);
+    const wsSvc = XLSX.utils.aoa_to_sheet([svcHeaders, ...svcRows]);
+    wsSvc["!cols"] = [{ wch:12 },{ wch:30 },{ wch:14 },{ wch:14 },{ wch:14 }];
+    XLSX.utils.book_append_sheet(wb, wsSvc, "Servicios");
+
+    // Hoja: Registro de Citas
+    const apptHeaders = ["ID Cita", "Fecha", "ID Cliente", "Nombre Cliente", "ID Servicio", "Servicio", "Valor (COP)", "Profesional", "Estado"];
+    const apptRows = appData.appointments.map(a => {
+      const c = getClient(a.clientId);
+      const s = getService(a.serviceId);
+      return [a.id, a.date, a.clientId, c?.name||"", a.serviceId, s?.name||"", a.value, a.professional, a.status];
+    });
+    const wsAppt = XLSX.utils.aoa_to_sheet([apptHeaders, ...apptRows]);
+    wsAppt["!cols"] = [{ wch:10 },{ wch:12 },{ wch:12 },{ wch:26 },{ wch:12 },{ wch:28 },{ wch:14 },{ wch:14 },{ wch:12 }];
+    XLSX.utils.book_append_sheet(wb, wsAppt, "Registro de Citas");
+
+    // Descargar
+    const fecha = new Date().toISOString().slice(0,10);
+    XLSX.writeFile(wb, `AuraSpa_Backup_${fecha}.xlsx`);
+    showToolbarStatus("✅ Excel exportado exitosamente");
+
+  } catch (err) {
+    console.error("Error al exportar:", err);
+    alert("❌ Error al generar el archivo Excel.");
+  }
+}
+
+// ── RESTAURAR DATOS DE EJEMPLO ──
+function resetData() {
+  if (!confirm("⚠️ Esto reemplazará los datos locales con los datos de ejemplo.\n\nPara sincronizar con Google Sheets, usa el botón 'Sincronizar'.\n\n¿Continuar?")) return;
+  appData = JSON.parse(JSON.stringify(DEFAULT_DATA));
+  saveData();
+  renderPage();
+  showToolbarStatus("✅ Datos de ejemplo restaurados (solo local)");
+}
+
+/* ────────────────────────────────────────────
    SECCIÓN K: Inicialización
    ──────────────────────────────────────────── */
 async function init() {
+  // Mostrar estado de carga
+  const wrapper = $("#page-wrapper");
+  if (wrapper) {
+    wrapper.innerHTML = `
+      <div style="display:flex;justify-content:center;align-items:center;min-height:50vh;flex-direction:column;gap:12px">
+        <div style="font-size:40px">🌿</div>
+        <div style="font-family:var(--font-display);font-size:20px;color:var(--cafe-medio)">Conectando con Google Sheets...</div>
+        <div style="font-size:13px;color:var(--cafe-suave)">Si no hay conexión, se usarán datos locales</div>
+      </div>
+    `;
+  }
   await loadData();
   buildNav();
   renderPage();
